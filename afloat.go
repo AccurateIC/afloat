@@ -9,8 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dgraph-io/ristretto"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/log"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/helmet"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
@@ -20,8 +23,25 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// TODO: validator only parses first rule, 
+// TODO: validator only parses first rule,
 // it should return error according to which rule failed
+
+
+var rcache *ristretto.Cache
+
+func initCache() {
+	var err error
+	rcache, err = ristretto.NewCache(&ristretto.Config{
+		NumCounters: 1e7,     // recommended: 10x number of items
+		MaxCost:     1 << 30, // 1 GB max cost
+		BufferItems: 64,      // recommended
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+
 
 var validate = validator.New() // global validator instance
 
@@ -66,11 +86,11 @@ func rootHandler(c *fiber.Ctx) error {
 }
 
 type PortCallRequestBody struct {
-	Days   int16 `json:"days" validate:"required,min=1,max=15"`
+	Days int16 `json:"days" validate:"required,min=1,max=15"`
 }
 
 type BerthCallRequestBody struct {
-	Days   int16 `json:"days" validate:"required,min=1",max=15`
+	Days int16 `json:"days" validate:"required,min=1",max=15`
 }
 
 func portCallHandler(c *fiber.Ctx, validator *XValidator) error {
@@ -79,6 +99,12 @@ func portCallHandler(c *fiber.Ctx, validator *XValidator) error {
 	if err := c.BodyParser(body); err != nil {
 		log.Error(err)
 		return err
+	}
+	cacheKey := fmt.Sprintf("portcall:%d", body.Days)
+	// Retrieve cache
+	if cached, found := rcache.Get(cacheKey); found {
+		c.Set("Content-Type", "text/csv")
+		return c.Send(cached.([]byte))
 	}
 
 	if errs := validator.Validate(body); len(errs) > 0 && errs[0].Error {
@@ -172,6 +198,8 @@ func portCallHandler(c *fiber.Ctx, validator *XValidator) error {
 		log.Error("Failed to read response body for port call", err)
 		return err
 	}
+	rcache.SetWithTTL(cacheKey, csvData, 1, 5*time.Minute) // cost = 1, ttl = 5min
+	rcache.Wait() // optional but recommended for sync safety
 
 	c.Set("Content-Type", "text/csv")
 
@@ -185,7 +213,13 @@ func BerthCallHandler(c *fiber.Ctx, validator *XValidator) error {
 		log.Error(err)
 		return err
 	}
-
+	log.Info("Body: ", body)
+	cacheKey := fmt.Sprintf("berthcall:%d", body.Days)
+	// Retrieve cache
+	if cached, found := rcache.Get(cacheKey); found {
+		c.Set("Content-Type", "text/csv")
+		return c.Send(cached.([]byte))
+	}
 
 	if errs := validator.Validate(body); len(errs) > 0 && errs[0].Error {
 		errMsgs := make([]string, 0)
@@ -204,7 +238,6 @@ func BerthCallHandler(c *fiber.Ctx, validator *XValidator) error {
 			Message: strings.Join(errMsgs, " and "),
 		}
 	}
-
 
 	API_KEY := os.Getenv("BERTH_CALL_API_KEY")
 	if API_KEY == "" {
@@ -279,15 +312,23 @@ func BerthCallHandler(c *fiber.Ctx, validator *XValidator) error {
 		log.Error("Failed to read response body for port call", err)
 		return err
 	}
+	rcache.SetWithTTL(cacheKey, csvData, 1, 5*time.Minute) // cost = 1, ttl = 5min
+	rcache.Wait() // optional but recommended for sync safety
+
+	expiresHeader := response.Header.Get("expires")
+	if expiresHeader != "" {
+		c.Set("expires", expiresHeader)
+		log.Info("set expires header: ", expiresHeader)
+	}
 
 	c.Set("Content-Type", "text/csv")
 
 	return c.Send(csvData)
 
-	
 }
 
 func main() {
+	initCache()
 	myValidator := &XValidator{
 		validator: validate,
 	}
@@ -306,6 +347,7 @@ func main() {
 	}
 
 	// global middlewares
+	app.Use(cors.New())
 	app.Use(requestid.New())
 	app.Use(logger.New(logger.Config{
 		Format: "${pid} ${locals:requestid} ${status} - ${method} ${path}​\n",
